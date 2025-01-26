@@ -1,7 +1,7 @@
-def detect_flask():
+def detect_poe_test_package():
     try:
-        import flask
+        import poe_test_package
 
-        print("Flask found at", flask.__file__)
-    except:
-        print("No flask found")
+        print("poe_test_package found at", poe_test_package.__file__)
+    except:  # noqa: E722
+        print("No poe_test_package found")

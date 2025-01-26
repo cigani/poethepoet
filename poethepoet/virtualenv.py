@@ -1,7 +1,8 @@
 import os
-from pathlib import Path
+import shutil
 import sys
-from typing import Dict, MutableMapping
+from collections.abc import Mapping
+from pathlib import Path
 
 
 class Virtualenv:
@@ -25,17 +26,20 @@ class Virtualenv:
 
     def resolve_executable(self, executable: str) -> str:
         """
-        If the given executable can be found in the bin_dir then return its absolute path
+        If the given executable can be found in the bin_dir then return its absolute
+        path. Otherwise return the input.
         """
         bin_dir = self.bin_dir()
         if bin_dir.joinpath(executable).is_file():
             return str(bin_dir.joinpath(executable))
-        if (
-            self._is_windows
-            and not executable.endswith(".exe")
-            and bin_dir.joinpath(f"{executable}.exe").is_file()
-        ):
-            return str(bin_dir.joinpath(f"{executable}.exe"))
+        if self._is_windows:
+            if bin_dir.joinpath(f"{executable}.com").is_file():
+                return str(bin_dir.joinpath(f"{executable}.com"))
+            if bin_dir.joinpath(f"{executable}.exe").is_file():
+                return str(bin_dir.joinpath(f"{executable}.exe"))
+            if bin_dir.joinpath(f"{executable}.bat").is_file():
+                return str(bin_dir.joinpath(f"{executable}.bat"))
+            return shutil.which(executable) or executable
         return executable
 
     @staticmethod
@@ -68,19 +72,33 @@ class Virtualenv:
             and bin_dir.joinpath("python").is_file()
             and bool(
                 next(
-                    self.path.glob(os.path.sep.join(("lib", "python3*", "site-packages"))),  # type: ignore
+                    self.path.glob(
+                        os.path.sep.join(("lib", "python3*", "site-packages"))
+                    ),
                     False,
                 )
             )
         )
 
-    def get_env_vars(self, base_env: MutableMapping[str, str]) -> Dict[str, str]:
-        path_delim = ";" if self._is_windows else ":"
+    def get_env_vars(self, base_env: Mapping[str, str]) -> dict[str, str]:
+        bin_dir = str(self.bin_dir())
+        # Revert path update from existing virtualenv if applicable
+        path_var = os.environ.get("_OLD_VIRTUAL_PATH", "") or os.environ.get("PATH", "")
+        old_path_var = path_var
+
+        if not path_var.startswith(bin_dir):
+            path_delim = ";" if self._is_windows else ":"
+            path_var = bin_dir + path_delim + path_var
+
         result = dict(
             base_env,
             VIRTUAL_ENV=str(self.path),
-            PATH=f"{self.bin_dir()}{path_delim}{os.environ.get('PATH', '')}",
+            _OLD_VIRTUAL_PATH=old_path_var,
+            PATH=path_var,
         )
+
         if "PYTHONHOME" in result:
+            result["_OLD_VIRTUAL_PYTHONHOME"] = result["PYTHONHOME"]
             result.pop("PYTHONHOME")
+
         return result

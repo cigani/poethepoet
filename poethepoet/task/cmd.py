@@ -1,21 +1,14 @@
-from glob import glob
-import re
 import shlex
-from typing import (
-    Dict,
-    Iterable,
-    MutableMapping,
-    Type,
-    TYPE_CHECKING,
-)
+from typing import TYPE_CHECKING
+
+from ..exceptions import ConfigValidationError, PoeException
 from .base import PoeTask
 
 if TYPE_CHECKING:
     from ..config import PoeConfig
     from ..context import RunContext
-
-_GLOBCHARS_PATTERN = re.compile(r".*[\*\?\[]")
-_QUOTED_TOKEN_PATTERN = re.compile(r"(^\".*\"$|^'.*'$)")
+    from ..env.manager import EnvVarsManager
+    from .base import TaskSpecFactory
 
 
 class CmdTask(PoeTask):
@@ -23,56 +16,80 @@ class CmdTask(PoeTask):
     A task consisting of a reference to a shell command
     """
 
-    content: str
-
     __key__ = "cmd"
-    __options__: Dict[str, Type] = {}
+
+    class TaskOptions(PoeTask.TaskOptions):
+        use_exec: bool = False
+
+        def validate(self):
+            """
+            Validation rules that don't require any extra context go here.
+            """
+            super().validate()
+            if self.use_exec and self.capture_stdout:
+                raise ConfigValidationError(
+                    "'use_exec' and 'capture_stdout'"
+                    " options cannot be both provided on the same task."
+                )
+
+    class TaskSpec(PoeTask.TaskSpec):
+        content: str
+        options: "CmdTask.TaskOptions"
+
+        def _task_validations(self, config: "PoeConfig", task_specs: "TaskSpecFactory"):
+            """
+            Perform validations on this TaskSpec that apply to a specific task type
+            """
+            if not self.content.strip():
+                raise ConfigValidationError("Task has no content")
+
+    spec: TaskSpec
 
     def _handle_run(
         self,
         context: "RunContext",
-        extra_args: Iterable[str],
-        env: MutableMapping[str, str],
+        env: "EnvVarsManager",
     ) -> int:
-        cmd = (*self._resolve_args(context, env), *extra_args)
-        self._print_action(" ".join(cmd), context.dry)
-        return context.get_executor(env, self.options.get("executor")).execute(cmd)
+        named_arg_values, extra_args = self.get_parsed_arguments(env)
+        env.update(named_arg_values)
 
-    def _resolve_args(
-        self, context: "RunContext", env: MutableMapping[str, str],
-    ):
-        # Parse shell command tokens and check if they're quoted
-        if self._is_windows:
-            cmd_tokens = (
-                (compat_token, bool(_QUOTED_TOKEN_PATTERN.match(compat_token)))
-                for compat_token in shlex.split(
-                    self._resolve_envvars(self.content, context, env),
-                    posix=False,
-                    comments=True,
-                )
+        cmd = (*self._resolve_commandline(context, env), *extra_args)
+
+        self._print_action(shlex.join(cmd), context.dry)
+
+        return self._get_executor(context, env).execute(
+            cmd, use_exec=self.spec.options.get("use_exec", False)
+        )
+
+    def _resolve_commandline(self, context: "RunContext", env: "EnvVarsManager"):
+        from ..helpers.command import parse_poe_cmd, resolve_command_tokens
+        from ..helpers.command.ast_core import ParseError
+
+        try:
+            command_lines = parse_poe_cmd(self.spec.content).command_lines
+        except ParseError as error:
+            raise PoeException(
+                f"Couldn't parse command line for task {self.name!r}", error
             )
-        else:
-            cmd_tokens = (
-                (posix_token, bool(_QUOTED_TOKEN_PATTERN.match(compat_token)))
-                for (posix_token, compat_token) in zip(
-                    shlex.split(
-                        self._resolve_envvars(self.content, context, env),
-                        posix=True,
-                        comments=True,
-                    ),
-                    shlex.split(
-                        self._resolve_envvars(self.content, context, env),
-                        posix=False,
-                        comments=True,
-                    ),
-                )
+
+        if not command_lines:
+            raise PoeException(
+                f"Invalid cmd task {self.name!r} does not include any command lines"
             )
-        # Resolve any unquoted glob pattern paths
+        if any(line.terminator == ";" for line in command_lines[:-1]):
+            # lines terminated by a line break or comment are implicitly joined
+            raise PoeException(
+                f"Invalid cmd task {self.name!r} includes multiple command lines"
+            )
+
+        working_dir = self.get_working_dir(env)
+
         result = []
-        for (cmd_token, is_quoted) in cmd_tokens:
-            if not is_quoted and _GLOBCHARS_PATTERN.match(cmd_token):
-                # looks like a glob path so resolve it
-                result.extend(glob(cmd_token, recursive=True))
+        for cmd_token, has_glob in resolve_command_tokens(command_lines, env):
+            if has_glob:
+                # Resolve glob pattern from the working directory
+                result.extend([str(match) for match in working_dir.glob(cmd_token)])
             else:
                 result.append(cmd_token)
+
         return result

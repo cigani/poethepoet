@@ -1,17 +1,13 @@
-from typing import (
-    Any,
-    Dict,
-    Iterable,
-    MutableMapping,
-    Optional,
-    Type,
-    TYPE_CHECKING,
-)
-from .base import PoeTask
+from typing import TYPE_CHECKING
+
+from ..exceptions import ConfigValidationError
+from .base import PoeTask, TaskContext
 
 if TYPE_CHECKING:
     from ..config import PoeConfig
     from ..context import RunContext
+    from ..env.manager import EnvVarsManager
+    from .base import TaskSpecFactory
 
 
 class RefTask(PoeTask):
@@ -19,34 +15,98 @@ class RefTask(PoeTask):
     A task consisting of a reference to another task
     """
 
-    # TODO: support extending/overriding env or other configuration of the referenced task
-
-    content: str
-
     __key__ = "ref"
-    __options__: Dict[str, Type] = {}
+
+    class TaskOptions(PoeTask.TaskOptions):
+        def validate(self):
+            """
+            Validation rules that don't require any extra context go here.
+            """
+            if self.executor:
+                raise ConfigValidationError(
+                    "Option 'executor' cannot be set on a ref task"
+                )
+            if self.capture_stdout:
+                raise ConfigValidationError(
+                    "Option 'capture_stdout' cannot be set on a ref task"
+                )
+
+    class TaskSpec(PoeTask.TaskSpec):
+        content: str
+        options: "RefTask.TaskOptions"
+
+        def _task_validations(self, config: "PoeConfig", task_specs: "TaskSpecFactory"):
+            """
+            Perform validations on this TaskSpec that apply to a specific task type
+            """
+
+            import shlex
+
+            task_name_ref = shlex.split(self.content)[0]
+
+            if task_name_ref not in task_specs:
+                raise ConfigValidationError(
+                    f"Includes reference to unknown task {task_name_ref!r}"
+                )
+
+            if task_specs.get(task_name_ref).options.get("use_exec", False):
+                raise ConfigValidationError(
+                    f"Illegal reference to task with "
+                    f"'use_exec' set to true: {task_name_ref!r}"
+                )
+
+    spec: TaskSpec
 
     def _handle_run(
         self,
         context: "RunContext",
-        extra_args: Iterable[str],
-        env: MutableMapping[str, str],
+        env: "EnvVarsManager",
     ) -> int:
         """
         Lookup and delegate to the referenced task
         """
-        task = self.from_config(self.content, self._config, ui=self._ui)
-        return task.run(context=context, extra_args=extra_args, env=env,)
+        import shlex
 
-    @classmethod
-    def _validate_task_def(
-        cls, task_name: str, task_def: Dict[str, Any], config: "PoeConfig"
-    ) -> Optional[str]:
-        """
-        Check the given task definition for validity specific to this task type and
-        return a message describing the first encountered issue if any.
-        """
-        if task_def["ref"] not in config.tasks:
-            return f"Task {task_name!r} contains reference to unkown task {task_def['ref']!r}"
+        named_arg_values, extra_args = self.get_parsed_arguments(env)
+        env.update(named_arg_values)
 
-        return None
+        ref_invocation = (
+            *(
+                env.fill_template(token)
+                for token in shlex.split(env.fill_template(self.spec.content.strip()))
+            ),
+            *extra_args,
+        )
+
+        task = self.ctx.specs.get(ref_invocation[0]).create_task(
+            invocation=ref_invocation, ctx=TaskContext.from_task(self)
+        )
+
+        if task.has_deps():
+            return self._run_task_graph(task, context, env)
+
+        return task.run(context=context, parent_env=env)
+
+    def _run_task_graph(
+        self,
+        task: "PoeTask",
+        context: "RunContext",
+        env: "EnvVarsManager",
+    ) -> int:
+        from ..exceptions import ExecutionError
+        from .graph import TaskExecutionGraph
+
+        graph = TaskExecutionGraph(task, context)
+        plan = graph.get_execution_plan()
+        for stage in plan:
+            for stage_task in stage:
+                if stage_task == task:
+                    # The final sink task gets special treatment
+                    return task.run(context=context, parent_env=env)
+
+                task_result = stage_task.run(context=context)
+                if task_result:
+                    raise ExecutionError(
+                        f"Task graph aborted after failed task {stage_task.name!r}"
+                    )
+        return 0

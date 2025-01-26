@@ -1,101 +1,161 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  pull_request:
+    branches:
+      - main
+      - development
+  push:
+    branches:
+      - main
+      - development
+    tags:
+      - v*
 
 jobs:
 
-  code-style:
-    runs-on: ubuntu-latest
-
+  code-quality:
     name: Check coding standards
-
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
-        with:
-          python-version: 3.6
-      - uses: actions/cache@v2
-        with:
-          path: ~/.cache/pypoetry/virtualenvs
-          key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-poetry-
+      - uses: actions/checkout@v4
 
       - name: Install poetry
-        shell: bash
-        run: |
-          python -m pip install poetry
-          echo "$HOME/.poetry/bin" >> $GITHUB_PATH
+        run: pipx install poetry
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
+          cache: poetry
 
       - name: Install dependencies
-        run: poetry install
+        run: poetry --ansi install
 
       - name: Check code formatting
-        run: poetry run poe style
+        run: poetry --ansi run poe style
 
       - name: Run linter
-        run: poetry run poe lint
+        run: poetry --ansi run poe lint
 
       - name: Check types
-        run: poetry run poe types
+        run: poetry --ansi run poe types
 
       - name: Check rst syntax
-        run: poetry run poe check-docs
+        run: poetry --ansi run poe docs-check
 
   run-tests:
-    runs-on: ${{ matrix.os }}-latest
-
     name: Run tests
-
     strategy:
       matrix:
         os: [Ubuntu, MacOS, Windows]
-        python-version: [ '3.6', '3.7' , '3.8' ]
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
 
+    runs-on: ${{ matrix.os }}-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/checkout@v4
+
+      - name: Install poetry
+        run: pipx install poetry
+
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - uses: actions/cache@v2
-        with:
-          path: ~/.cache/pypoetry/virtualenvs
-          key: ${{ runner.os }}-poetry-${{ hashFiles('poetry.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-poetry-
-
-      - name: Install poetry
-        shell: bash
-        run: |
-          python -m pip install poetry
-          echo "$HOME/.poetry/bin" >> $GITHUB_PATH
+          cache: poetry
 
       - name: Install dependencies
-        run: poetry install
+        run: poetry --ansi install --without docs
 
       - name: Run tests
-        run: poetry run pytest -v
+        run: poetry --ansi run pytest -v --color=yes
 
-  build-release:
+  build:
+    name: Build distribution
     runs-on: ubuntu-latest
-
+    needs: [code-quality, run-tests]
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
-        with:
-          python-version: 3.7
+      - uses: actions/checkout@v4
 
       - name: Install poetry
-        shell: bash
-        run: |
-          python -m pip install poetry
-          echo "$HOME/.poetry/bin" >> $GITHUB_PATH
+        run: pipx install poetry
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
 
       - name: Build package
-        run: poetry build
+        run: poetry --ansi build
 
-      - name: Publish package to PyPI
+      - name: Store the distribution packages
         if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
-        run: poetry publish -n
-        env:
-          POETRY_PYPI_TOKEN_PYPI: ${{ secrets.pypi }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+  pypi-publish:
+    name: Upload release to PyPI
+    if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/poethepoet
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all the dists
+        uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish distribution 📦 to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  homebrew-publish:
+    name: Upload homebrew formula
+    needs: [pypi-publish]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger update of homebrew formula
+        run: |
+          sleep 10 # some delay seems to be necessary
+          curl -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.homebrew_pat }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/nat-n/homebrew-poethepoet/actions/workflows/71211730/dispatches \
+            -d '{"ref":"main", "inputs":{}}'
+
+  github-release:
+    name: >-
+      Sign the Python 🐍 distribution 📦 with Sigstore and upload them to GitHub Release
+    needs: [pypi-publish]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+    - name: Download all the dists
+      uses: actions/download-artifact@v4
+      with:
+        name: python-package-distributions
+        path: dist/
+    - name: Sign the dists with Sigstore
+      uses: sigstore/gh-action-sigstore-python@v3.0.0
+      with:
+        inputs: >-
+          ./dist/*.tar.gz
+          ./dist/*.whl
+    - name: Upload artifact signatures to GitHub Release
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      # Upload to GitHub Release using the `gh` CLI.
+      # `dist/` contains the built packages, and the
+      # sigstore-produced signatures and certificates.
+      run: >-
+        gh release upload
+        '${{ github.ref_name }}' dist/**
+        --repo '${{ github.repository }}'
